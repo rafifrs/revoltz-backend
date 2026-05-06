@@ -43,3 +43,17 @@ class InventoryBattery(Base):
     cell_analysis_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class MarketplaceListing(Base):
+    __tablename__ = "marketplace_listings"
+
+    id = Column(String, primary_key=True, index=True)
+    inventory_battery_id = Column(String, nullable=False, unique=True, index=True)
+    workshop_user_id = Column(Integer, nullable=False, index=True)
+    model_name = Column(String, nullable=False)
+    price = Column(Integer, nullable=False)
+    warranty_months = Column(Integer, nullable=False, default=6)
+    status = Column(String, nullable=False, default="active")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

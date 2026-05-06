@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from auth_utils import decode_token
 from database import Base, engine, get_db
-from models import InventoryBattery, User
+from models import InventoryBattery, MarketplaceListing, User
 from routers.auth import router as auth_router
 
 import os
@@ -48,6 +48,12 @@ class CellAnalysisPersistRequest(BaseModel):
     analysis_result: dict
 
 
+class MarketplaceListingRequest(BaseModel):
+    price: int
+    model_name: str | None = None
+    warranty_months: int | None = 6
+
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
     try:
         return decode_token(credentials.credentials)
@@ -71,7 +77,42 @@ def _safe_json_loads(value: str | None):
         return None
 
 
-def serialize_inventory_battery(item: InventoryBattery) -> dict:
+def serialize_marketplace_listing(item: InventoryBattery, listing, workshop_user: User | None) -> dict:
+    seller_name = (
+        (workshop_user.workshop_name or workshop_user.full_name)
+        if workshop_user
+        else "Workshop Partner"
+    )
+    seller_location = workshop_user.address if workshop_user and workshop_user.address else "Indonesia"
+
+    return {
+        "id": listing.id,
+        "inventory_battery_id": item.id,
+        "pack_id": item.pack_id,
+        "model_name": listing.model_name,
+        "chemistry": item.chemistry,
+        "soh": item.soh,
+        "price": listing.price,
+        "cycles": item.cycle_count,
+        "warranty_months": listing.warranty_months,
+        "seller_location": seller_location,
+        "seller_name": seller_name,
+        "rating": 4.8,
+        "verified": True,
+        "age_days": item.age_days,
+        "capacity_ah": item.capacity_ah,
+        "voltage_v": item.ocv_v,
+        "recommended_action": item.recommended_action,
+        "status": listing.status,
+        "listed_at": listing.updated_at.isoformat() if listing.updated_at else None,
+    }
+
+
+def serialize_inventory_battery(
+    item: InventoryBattery,
+    listing=None,
+    workshop_user: User | None = None,
+) -> dict:
     pack_analysis = _safe_json_loads(item.pack_analysis_json) or {}
     cell_analysis = _safe_json_loads(item.cell_analysis_json)
     notes = _safe_json_loads(item.pack_notes_json) or []
@@ -94,6 +135,22 @@ def serialize_inventory_battery(item: InventoryBattery) -> dict:
       "last_updated": item.updated_at.strftime("%Y-%m-%d") if item.updated_at else None,
       "created_at": item.created_at.isoformat() if item.created_at else None,
       "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+      "marketplace_listing": (
+          {
+              "id": listing.id,
+              "model_name": listing.model_name,
+              "price": listing.price,
+              "warranty_months": listing.warranty_months,
+              "status": listing.status,
+              "seller_name": (
+                  (workshop_user.workshop_name or workshop_user.full_name)
+                  if workshop_user
+                  else None
+              ),
+          }
+          if listing
+          else None
+      ),
       "pack_analysis": {
           **pack_analysis,
           "notes": notes,
@@ -106,6 +163,10 @@ def serialize_inventory_battery(item: InventoryBattery) -> dict:
       },
       "cell_analysis": cell_analysis,
     }
+
+
+def get_inventory_battery_by_id(db: Session, battery_id: str) -> InventoryBattery | None:
+    return db.query(InventoryBattery).filter(InventoryBattery.id == battery_id).first()
 
 
 @app.get("/health")
@@ -174,7 +235,17 @@ async def get_inventory(
         .order_by(InventoryBattery.updated_at.desc(), InventoryBattery.created_at.desc())
         .all()
     )
-    batteries = [serialize_inventory_battery(item) for item in items]
+    listing_map = {
+        listing.inventory_battery_id: listing
+        for listing in db.query(MarketplaceListing)
+        .filter(MarketplaceListing.workshop_user_id == workshop_user_id)
+        .all()
+    }
+    workshop_user = db.query(User).filter(User.id == workshop_user_id).first()
+    batteries = [
+        serialize_inventory_battery(item, listing_map.get(item.id), workshop_user)
+        for item in items
+    ]
     return {"batteries": batteries, "total": len(batteries)}
 
 
@@ -195,7 +266,16 @@ async def get_inventory_battery_detail(
     )
     if not item:
         raise HTTPException(status_code=404, detail="Battery not found in inventory.")
-    return {"battery": serialize_inventory_battery(item)}
+    listing = (
+        db.query(MarketplaceListing)
+        .filter(
+            MarketplaceListing.inventory_battery_id == item.id,
+            MarketplaceListing.workshop_user_id == workshop_user_id,
+        )
+        .first()
+    )
+    workshop_user = db.query(User).filter(User.id == workshop_user_id).first()
+    return {"battery": serialize_inventory_battery(item, listing, workshop_user)}
 
 
 @app.post("/inventory/{battery_id}/cell-analysis")
@@ -221,7 +301,120 @@ async def save_cell_analysis(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return {"battery": serialize_inventory_battery(item)}
+    listing = (
+        db.query(MarketplaceListing)
+        .filter(
+            MarketplaceListing.inventory_battery_id == item.id,
+            MarketplaceListing.workshop_user_id == workshop_user_id,
+        )
+        .first()
+    )
+    workshop_user = db.query(User).filter(User.id == workshop_user_id).first()
+    return {"battery": serialize_inventory_battery(item, listing, workshop_user)}
+
+
+@app.get("/inventory/{battery_id}/marketplace-listing")
+async def get_marketplace_listing_for_battery(
+    battery_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    workshop_user_id = _current_user_id(current_user)
+    item = (
+        db.query(InventoryBattery)
+        .filter(
+            InventoryBattery.id == battery_id,
+            InventoryBattery.workshop_user_id == workshop_user_id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Battery not found in inventory.")
+
+    listing = (
+        db.query(MarketplaceListing)
+        .filter(
+            MarketplaceListing.inventory_battery_id == item.id,
+            MarketplaceListing.workshop_user_id == workshop_user_id,
+        )
+        .first()
+    )
+    workshop_user = db.query(User).filter(User.id == workshop_user_id).first()
+    return {
+        "listing": serialize_marketplace_listing(item, listing, workshop_user) if listing else None,
+    }
+
+
+@app.get("/battery-profiles/{battery_id}")
+async def get_public_battery_profile(
+    battery_id: str,
+    db: Session = Depends(get_db),
+):
+    item = get_inventory_battery_by_id(db, battery_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Battery not found.")
+
+    listing = (
+        db.query(MarketplaceListing)
+        .filter(MarketplaceListing.inventory_battery_id == item.id)
+        .first()
+    )
+    workshop_user = db.query(User).filter(User.id == item.workshop_user_id).first()
+    return {"battery": serialize_inventory_battery(item, listing, workshop_user)}
+
+
+@app.post("/inventory/{battery_id}/marketplace-listing", status_code=status.HTTP_201_CREATED)
+async def publish_marketplace_listing(
+    battery_id: str,
+    payload: MarketplaceListingRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    workshop_user_id = _current_user_id(current_user)
+    item = (
+        db.query(InventoryBattery)
+        .filter(
+            InventoryBattery.id == battery_id,
+            InventoryBattery.workshop_user_id == workshop_user_id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Battery not found in inventory.")
+    if payload.price <= 0:
+        raise HTTPException(status_code=400, detail="Price must be greater than zero.")
+
+    workshop_user = db.query(User).filter(User.id == workshop_user_id).first()
+    listing = (
+        db.query(MarketplaceListing)
+        .filter(MarketplaceListing.inventory_battery_id == item.id)
+        .first()
+    )
+    default_model_name = f"{(item.chemistry or 'EV').upper()} Battery Pack"
+    if listing:
+        listing.price = payload.price
+        listing.model_name = (payload.model_name or listing.model_name or default_model_name).strip()
+        listing.warranty_months = payload.warranty_months or listing.warranty_months or 6
+        listing.status = "active"
+    else:
+        listing = MarketplaceListing(
+            id=f"mkt_{uuid4().hex[:8]}",
+            inventory_battery_id=item.id,
+            workshop_user_id=workshop_user_id,
+            model_name=(payload.model_name or default_model_name).strip(),
+            price=payload.price,
+            warranty_months=payload.warranty_months or 6,
+            status="active",
+        )
+        db.add(listing)
+
+    db.add(listing)
+    db.commit()
+    db.refresh(listing)
+    return {
+        "listing": serialize_marketplace_listing(item, listing, workshop_user),
+        "battery": serialize_inventory_battery(item, listing, workshop_user),
+    }
 
 
 @app.get("/workshop/stats")
@@ -276,17 +469,17 @@ async def get_soh_distribution(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/marketplace")
-async def get_marketplace():
-    return {
-        "batteries": [
-            {"id": "mkt_001", "model_name": "Tesla Model 3", "chemistry": "NMC", "soh": 0.85, "price": 39500000, "cycles": 290, "warranty_months": 12, "seller_location": "Jakarta", "seller_name": "Jakarta EV Workshop", "rating": 4.8, "verified": True, "age_days": 730, "capacity_ah": 75.0, "voltage_v": 350},
-            {"id": "mkt_002", "model_name": "Nissan Leaf", "chemistry": "NMC", "soh": 0.80, "price": 28500000, "cycles": 450, "warranty_months": 6, "seller_location": "Surabaya", "seller_name": "Surabaya Battery Center", "rating": 4.8, "verified": True, "age_days": 1095, "capacity_ah": 40.0, "voltage_v": 360},
-            {"id": "mkt_003", "model_name": "BYD Atto 3", "chemistry": "LFP", "soh": 0.88, "price": 52000000, "cycles": 310, "warranty_months": 12, "seller_location": "Bandung", "seller_name": "Bandung EV Solutions", "rating": 4.8, "verified": True, "age_days": 548, "capacity_ah": 60.0, "voltage_v": 320},
-            {"id": "mkt_004", "model_name": "Hyundai Ioniq 5", "chemistry": "NMC", "soh": 0.84, "price": 58000000, "cycles": 385, "warranty_months": 18, "seller_location": "Jakarta", "seller_name": "Merdeka Battery", "rating": 4.7, "verified": True, "age_days": 640, "capacity_ah": 72.6, "voltage_v": 400},
-            {"id": "mkt_005", "model_name": "Tesla Model Y", "chemistry": "NMC", "soh": 0.89, "price": 62000000, "cycles": 170, "warranty_months": 18, "seller_location": "Bali", "seller_name": "Bali Green Energy", "rating": 4.9, "verified": True, "age_days": 420, "capacity_ah": 75.0, "voltage_v": 350},
-            {"id": "mkt_006", "model_name": "Nissan Leaf Gen2", "chemistry": "NMC", "soh": 0.76, "price": 22000000, "cycles": 620, "warranty_months": 3, "seller_location": "Surabaya", "seller_name": "Bali Green Energy", "rating": 4.6, "verified": True, "age_days": 1460, "capacity_ah": 40.0, "voltage_v": 360},
-            {"id": "mkt_007", "model_name": "Wuling Air EV", "chemistry": "LFP", "soh": 0.67, "price": 18500000, "cycles": 295, "warranty_months": 6, "seller_location": "Yogyakarta", "seller_name": "Nusantara Battery", "rating": 4.5, "verified": False, "age_days": 820, "capacity_ah": 26.7, "voltage_v": 280},
-            {"id": "mkt_008", "model_name": "BYD Dolphin", "chemistry": "LFP", "soh": 0.82, "price": 38000000, "cycles": 249, "warranty_months": 12, "seller_location": "Medan", "seller_name": "Tiga Roda EV", "rating": 4.7, "verified": True, "age_days": 600, "capacity_ah": 44.9, "voltage_v": 316},
-            {"id": "mkt_009", "model_name": "Toyota bZ4X", "chemistry": "NMC", "soh": 0.91, "price": 68000000, "cycles": 100, "warranty_months": 24, "seller_location": "Jakarta", "seller_name": "Bandung EV Solutions", "rating": 4.9, "verified": True, "age_days": 280, "capacity_ah": 71.4, "voltage_v": 355},
-        ]
-    }
+async def get_marketplace(db: Session = Depends(get_db)):
+    items = (
+        db.query(MarketplaceListing, InventoryBattery, User)
+        .join(InventoryBattery, MarketplaceListing.inventory_battery_id == InventoryBattery.id)
+        .join(User, MarketplaceListing.workshop_user_id == User.id)
+        .filter(MarketplaceListing.status == "active")
+        .order_by(MarketplaceListing.updated_at.desc(), MarketplaceListing.created_at.desc())
+        .all()
+    )
+    batteries = [
+        serialize_marketplace_listing(battery, listing, workshop_user)
+        for listing, battery, workshop_user in items
+    ]
+    return {"batteries": batteries, "total": len(batteries)}
